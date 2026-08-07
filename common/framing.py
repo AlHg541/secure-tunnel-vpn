@@ -14,6 +14,8 @@ import struct
 MAGIC = 0x5654  
 VERSION = 1
 
+MSG_AUTH_REQ  = 0x01
+MSG_AUTH_RESP = 0x02
 MSG_DATA      = 0x03
 MSG_HEARTBEAT = 0x04
 
