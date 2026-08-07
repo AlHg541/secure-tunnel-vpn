@@ -16,6 +16,7 @@ import threading
 import time
 import logging
 
+from server.user_portal import create_app as create_portal_app
 from common import framing, config
 from common.crypto import TunnelCrypto
 from common.tun_interface import TUNInterface
@@ -145,6 +146,16 @@ def kick_client(inner_ip):
         except OSError:
             pass
 
+def refresh_user_quota(username):
+    """Apply a fresh quota to the user's LIVE session (no reconnect needed)."""
+    user = db.get_user(username)
+    if not user:
+        return
+    with clients_lock:
+        for s in client_stats.values():
+            if s["username"] == username:
+                s["quota"] = user["quota_bytes"]
+    log.info("quota refreshed live for %s", username)
 
 def downlink(conn, addr, inner_ip):
     """Client -> handshake -> decrypt -> monitor -> rate-limit -> TUN."""
@@ -251,6 +262,12 @@ def main():
     srv.listen(8)
     log.info("server listening on 0.0.0.0:%d", config.SERVER_PORT)
 
+    portal = create_portal_app(db, refresh_user_quota)
+    threading.Thread(
+        target=lambda: portal.run(host="0.0.0.0", port=8001,
+                                  debug=False, use_reloader=False),
+        name="user-portal", daemon=True).start()
+    log.info("user portal on http://0.0.0.0:8001")
     while True:
         conn, addr = srv.accept()
         threading.Thread(target=downlink, args=(conn, addr, config.TUN_CLIENT_IP),
