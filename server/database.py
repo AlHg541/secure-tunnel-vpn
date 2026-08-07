@@ -49,6 +49,16 @@ class Database:
                 active INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
+            CREATE TABLE IF NOT EXISTS traffic_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            dst_ip TEXT,
+            dst_port INTEGER,
+            protocol TEXT,
+            app_protocol TEXT,
+            domain TEXT
+            );
             """)
             self.conn.commit()
 
@@ -126,6 +136,22 @@ class Database:
                 "UPDATE users SET quota_bytes=quota_bytes+?, status='active' WHERE username=?",
                 (extra_bytes, username))
             self.conn.commit()
+    def log_traffic(self, username, dst_ip, dst_port, protocol, app_protocol, domain):
+      with self._lock:
+          self.conn.execute(
+              "INSERT INTO traffic_log(username, timestamp, dst_ip, dst_port,"
+              " protocol, app_protocol, domain) VALUES (?,?,?,?,?,?,?)",
+              (username, time.time(), dst_ip, dst_port, protocol,
+                app_protocol, domain))
+          self.conn.commit()
+
+    def get_traffic_log(self, limit=50):
+      with self._lock:
+          rows = self.conn.execute(
+              "SELECT username, dst_ip, dst_port, protocol, app_protocol,"
+              " domain FROM traffic_log ORDER BY id DESC LIMIT ?",
+              (limit,)).fetchall()
+          return [dict(r) for r in rows]
 
 
 def seed_default_users(db):
@@ -136,3 +162,4 @@ def seed_default_users(db):
     if db.get_user("banned_bob") is None:
         db.create_user("banned_bob", "bob-pass-123", status="banned")
         log.info("seeded user: banned_bob (banned)")
+

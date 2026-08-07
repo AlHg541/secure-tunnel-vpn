@@ -13,6 +13,7 @@ import threading
 import time
 import logging
 
+from server.traffic_monitor import TrafficMonitor
 from common import framing, config
 from common.crypto import TunnelCrypto
 from common.tun_interface import TUNInterface
@@ -32,6 +33,7 @@ crypto = TunnelCrypto(config.PSK_PASSPHRASE)
 tun = TUNInterface(name="tun0", ip_address=SERVER_TUN_IP)
 port_table = PortMappingTable()
 db = Database()
+monitor = TrafficMonitor(db)
 
 clients_lock = threading.Lock()
 inner_ip_to_conn = {}
@@ -162,6 +164,8 @@ def downlink(conn, addr, inner_ip):
                             port_table.add_connection(inner_ip, conn, sport, dport, proto_name)
 
                 limiter.wait_for(len(packet)) 
+                monitor.observe(user["username"], packet)
+                tun.write_packet(packet)
                 tun.write_packet(packet)
                 check_quota(inner_ip)
             elif msg_type == framing.MSG_HEARTBEAT:
