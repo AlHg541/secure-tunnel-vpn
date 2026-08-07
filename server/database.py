@@ -1,7 +1,9 @@
-"""SQLite storage for AAA (Phase 2, section 2).
+"""SQLite storage for AAA + traffic monitoring (Phase 2).
 
-Stores user accounts (credentials, status, quota) and active/historical
-sessions (connection time, upload/download counters).
+Tables:
+  users        : credentials, status, quota, rate_limit, role (user/admin)
+  sessions     : per-connection accounting (up/down bytes, timestamps)
+  traffic_log  : per-flow history (domain, app_protocol, timestamps)
 """
 import os
 import time
@@ -36,7 +38,8 @@ class Database:
                 status TEXT NOT NULL DEFAULT 'active',
                 quota_bytes INTEGER NOT NULL DEFAULT 2147483648,
                 used_bytes INTEGER NOT NULL DEFAULT 0,
-                rate_limit_bps INTEGER NOT NULL DEFAULT 524288
+                rate_limit_bps INTEGER NOT NULL DEFAULT 524288,
+                role TEXT NOT NULL DEFAULT 'user'
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,14 +53,14 @@ class Database:
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
             CREATE TABLE IF NOT EXISTS traffic_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            timestamp REAL NOT NULL,
-            dst_ip TEXT,
-            dst_port INTEGER,
-            protocol TEXT,
-            app_protocol TEXT,
-            domain TEXT
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                dst_ip TEXT,
+                dst_port INTEGER,
+                protocol TEXT,
+                app_protocol TEXT,
+                domain TEXT
             );
             """)
             self.conn.commit()
@@ -67,15 +70,18 @@ class Database:
         return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000).hex()
 
     def create_user(self, username, password, status="active",
-                    quota_bytes=2 * 1024 ** 3, rate_limit_bps=512 * 1024):
+                    quota_bytes=2 * 1024 ** 3, rate_limit_bps=512 * 1024,
+                    role="user"):
         salt = os.urandom(16)
         pw_hash = self._hash_password(password, salt)
         with self._lock:
             try:
                 self.conn.execute(
                     "INSERT INTO users(username, password_hash, salt, status,"
-                    " quota_bytes, used_bytes, rate_limit_bps) VALUES (?,?,?,?,?,0,?)",
-                    (username, pw_hash, salt.hex(), status, quota_bytes, rate_limit_bps))
+                    " quota_bytes, used_bytes, rate_limit_bps, role)"
+                    " VALUES (?,?,?,?,?,0,?,?)",
+                    (username, pw_hash, salt.hex(), status, quota_bytes,
+                     rate_limit_bps, role))
                 self.conn.commit()
                 return True
             except sqlite3.IntegrityError:
@@ -136,22 +142,29 @@ class Database:
                 "UPDATE users SET quota_bytes=quota_bytes+?, status='active' WHERE username=?",
                 (extra_bytes, username))
             self.conn.commit()
+
     def log_traffic(self, username, dst_ip, dst_port, protocol, app_protocol, domain):
-      with self._lock:
-          self.conn.execute(
-              "INSERT INTO traffic_log(username, timestamp, dst_ip, dst_port,"
-              " protocol, app_protocol, domain) VALUES (?,?,?,?,?,?,?)",
-              (username, time.time(), dst_ip, dst_port, protocol,
-                app_protocol, domain))
-          self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO traffic_log(username, timestamp, dst_ip, dst_port,"
+                " protocol, app_protocol, domain) VALUES (?,?,?,?,?,?,?)",
+                (username, time.time(), dst_ip, dst_port, protocol,
+                 app_protocol, domain))
+            self.conn.commit()
 
     def get_traffic_log(self, limit=50):
-      with self._lock:
-          rows = self.conn.execute(
-              "SELECT username, dst_ip, dst_port, protocol, app_protocol,"
-              " domain FROM traffic_log ORDER BY id DESC LIMIT ?",
-              (limit,)).fetchall()
-          return [dict(r) for r in rows]
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT username, timestamp, dst_ip, dst_port, protocol, app_protocol,"
+                " domain FROM traffic_log ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_all_users(self):
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(
+                "SELECT username, status, used_bytes, quota_bytes,"
+                " rate_limit_bps, role FROM users").fetchall()]
 
 
 def seed_default_users(db):
@@ -162,4 +175,6 @@ def seed_default_users(db):
     if db.get_user("banned_bob") is None:
         db.create_user("banned_bob", "bob-pass-123", status="banned")
         log.info("seeded user: banned_bob (banned)")
-
+    if db.get_user("admin") is None:
+        db.create_user("admin", "admin123", role="admin")
+        log.info("seeded admin account: admin/admin123")

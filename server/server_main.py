@@ -1,11 +1,14 @@
-"""VPN gateway server - Phase 2 step 2: AAA + QoS (rate limit + quota).
+"""VPN gateway server - Phase 2 complete: AAA + QoS + monitoring + admin.
 
-On top of authentication/authorization/accounting this adds:
-  - per-user bandwidth rate limiting (token bucket in user space,
-    applied on the TCP socket read/write path)
-  - total data usage limit: when used_bytes reaches quota_bytes the
-    server drops the current connection and flips the account status
-    to 'quota_exhausted' to block future connections.
+Features:
+  - Encrypted TCP tunnel (AES-256-GCM) with framing
+  - TUN interface + kernel NAT (ip_forward + MASQUERADE)
+  - AAA handshake (AUTH_REQ/AUTH_RESP) before any data
+  - Token-bucket rate limiting (per-user)
+  - Quota enforcement (disconnect + status flip)
+  - Traffic monitoring with domain extraction (DNS/HTTP/TLS SNI)
+  - Admin web panel (Flask on port 8000) with Kick action
+  - Active session tracking and byte counters (Accounting)
 """
 import json
 import socket
@@ -13,7 +16,6 @@ import threading
 import time
 import logging
 
-from server.traffic_monitor import TrafficMonitor
 from common import framing, config
 from common.crypto import TunnelCrypto
 from common.tun_interface import TUNInterface
@@ -21,13 +23,15 @@ from common.packet_utils import summarize_ip_packet
 from common.port_mapping import PortMappingTable
 from common.rate_limiter import RateLimiter
 from server.database import Database, seed_default_users
+from server.traffic_monitor import TrafficMonitor
+from server.admin_panel import create_app
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(threadName)s] %(levelname)s %(message)s")
 log = logging.getLogger("server")
 
 SERVER_TUN_IP = "10.8.0.1"
-FLUSH_INTERVAL = 5  
+FLUSH_INTERVAL = 5  # seconds
 
 crypto = TunnelCrypto(config.PSK_PASSPHRASE)
 tun = TUNInterface(name="tun0", ip_address=SERVER_TUN_IP)
@@ -37,7 +41,7 @@ monitor = TrafficMonitor(db)
 
 clients_lock = threading.Lock()
 inner_ip_to_conn = {}
-client_stats = {}  
+client_stats = {}   # inner_ip -> accounting + QoS state
 
 
 def send_auth_resp(conn, ok, message, **extra):
@@ -122,13 +126,33 @@ def accounting_flusher():
             flush_client(ip)
 
 
+def get_active_sessions():
+    """Live session list for the admin panel."""
+    with clients_lock:
+        return [{"username": s["username"], "inner_ip": ip,
+                 "up": s["up"], "down": s["down"]}
+                for ip, s in client_stats.items()]
+
+
+def kick_client(inner_ip):
+    """Admin action: drop a client connection instantly."""
+    with clients_lock:
+        conn = inner_ip_to_conn.get(inner_ip)
+    if conn:
+        log.warning("ADMIN KICK: %s", inner_ip)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
 def downlink(conn, addr, inner_ip):
-    """Client -> handshake -> decrypt -> rate-limit -> TUN."""
+    """Client -> handshake -> decrypt -> monitor -> rate-limit -> TUN."""
     reader = framing.FrameReader(conn)
 
     user = perform_handshake(conn, reader, addr)
     if user is None:
-        conn.close()  
+        conn.close()   # doc: invalid credentials -> immediate disconnect
         return
 
     session_id = db.start_session(user["id"], inner_ip)
@@ -163,14 +187,13 @@ def downlink(conn, addr, inner_ip):
                         if not port_table.get_connection(inner_ip, dport, proto_name):
                             port_table.add_connection(inner_ip, conn, sport, dport, proto_name)
 
-                limiter.wait_for(len(packet)) 
-                monitor.observe(user["username"], packet)
-                tun.write_packet(packet)
+                monitor.observe(user["username"], packet)   # log BEFORE NAT
+                limiter.wait_for(len(packet))   # upload shaping in user space
                 tun.write_packet(packet)
                 check_quota(inner_ip)
             elif msg_type == framing.MSG_HEARTBEAT:
                 log.debug("heartbeat from %s", inner_ip)
-    except (ConnectionError, framing.ProtocolError) as e:
+    except (ConnectionError, framing.ProtocolError, OSError) as e:
         log.info("client %s disconnected: %s", inner_ip, e)
     finally:
         flush_client(inner_ip)
@@ -201,7 +224,7 @@ def uplink():
             continue
         log.info("TX | %s", summarize_ip_packet(packet))
         if limiter:
-            limiter.wait_for(len(packet))  
+            limiter.wait_for(len(packet))   # download shaping in user space
         try:
             conn.sendall(framing.build_frame(framing.MSG_DATA, crypto.encrypt(packet)))
         except OSError:
@@ -214,6 +237,13 @@ def main():
     tun.create()
     threading.Thread(target=uplink, name="uplink", daemon=True).start()
     threading.Thread(target=accounting_flusher, name="accounting", daemon=True).start()
+
+    app = create_app(db, get_active_sessions, kick_client)
+    threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=8000,
+                               debug=False, use_reloader=False),
+        name="admin-panel", daemon=True).start()
+    log.info("admin panel on http://0.0.0.0:8000")
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
