@@ -1,12 +1,11 @@
-"""VPN gateway server - Phase 2 step 1: AAA handshake + accounting.
+"""VPN gateway server - Phase 2 step 2: AAA + QoS (rate limit + quota).
 
-Per-client flow:
-  1. TCP accept
-  2. AAA handshake (AUTH_REQ -> AUTH_RESP) BEFORE any data
-  3. Authorization check (active / not banned / quota remaining)
-  4. Active session row created (Accounting)
-  5. Data bridging (TUN + kernel NAT) with byte counters
-  6. Counters flushed to SQLite periodically; session closed on disconnect
+On top of authentication/authorization/accounting this adds:
+  - per-user bandwidth rate limiting (token bucket in user space,
+    applied on the TCP socket read/write path)
+  - total data usage limit: when used_bytes reaches quota_bytes the
+    server drops the current connection and flips the account status
+    to 'quota_exhausted' to block future connections.
 """
 import json
 import socket
@@ -19,6 +18,7 @@ from common.crypto import TunnelCrypto
 from common.tun_interface import TUNInterface
 from common.packet_utils import summarize_ip_packet
 from common.port_mapping import PortMappingTable
+from common.rate_limiter import RateLimiter
 from server.database import Database, seed_default_users
 
 logging.basicConfig(level=logging.INFO,
@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("server")
 
 SERVER_TUN_IP = "10.8.0.1"
-FLUSH_INTERVAL = 5
+FLUSH_INTERVAL = 5  
 
 crypto = TunnelCrypto(config.PSK_PASSPHRASE)
 tun = TUNInterface(name="tun0", ip_address=SERVER_TUN_IP)
@@ -35,7 +35,7 @@ db = Database()
 
 clients_lock = threading.Lock()
 inner_ip_to_conn = {}
-client_stats = {}
+client_stats = {}  
 
 
 def send_auth_resp(conn, ok, message, **extra):
@@ -71,7 +71,8 @@ def perform_handshake(conn, reader, addr):
 
     send_auth_resp(conn, True, "ok",
                    inner_ip=config.TUN_CLIENT_IP,
-                   quota_remaining=user["quota_bytes"] - user["used_bytes"])
+                   quota_remaining=user["quota_bytes"] - user["used_bytes"],
+                   rate_limit_bps=user["rate_limit_bps"])
     log.info("AUTH OK %s as %s", addr[0], user["username"])
     return user
 
@@ -89,6 +90,26 @@ def flush_client(inner_ip):
         db.add_user_usage(s["user_id"], du + dd)
 
 
+def check_quota(inner_ip):
+    """Total Data Usage Limit (Phase 2 section 3.2)."""
+    with clients_lock:
+        s = client_stats.get(inner_ip)
+        if not s:
+            return
+        exceeded = s["used_at_start"] + s["up"] + s["down"] >= s["quota"]
+    if exceeded:
+        log.warning("QUOTA EXHAUSTED for %s: dropping connection", s["username"])
+        flush_client(inner_ip)
+        db.set_user_status(s["username"], "quota_exhausted")
+        with clients_lock:
+            conn = inner_ip_to_conn.get(inner_ip)
+        if conn:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
 def accounting_flusher():
     """Periodically persist live traffic counters (Accounting)."""
     while True:
@@ -100,19 +121,24 @@ def accounting_flusher():
 
 
 def downlink(conn, addr, inner_ip):
-    """Client -> handshake -> decrypt -> TUN (kernel routes/NATs)."""
+    """Client -> handshake -> decrypt -> rate-limit -> TUN."""
     reader = framing.FrameReader(conn)
 
     user = perform_handshake(conn, reader, addr)
     if user is None:
-        conn.close()
+        conn.close()  
         return
 
     session_id = db.start_session(user["id"], inner_ip)
     with clients_lock:
         inner_ip_to_conn[inner_ip] = conn
-        client_stats[inner_ip] = {"user_id": user["id"], "session_id": session_id,
-                                  "up": 0, "down": 0, "flushed_up": 0, "flushed_down": 0}
+        client_stats[inner_ip] = {
+            "username": user["username"], "user_id": user["id"],
+            "session_id": session_id,
+            "up": 0, "down": 0, "flushed_up": 0, "flushed_down": 0,
+            "used_at_start": user["used_bytes"], "quota": user["quota_bytes"],
+            "limiter": RateLimiter(user["rate_limit_bps"]),
+        }
         log.info("client connected: %s as %s (online=%d)",
                  addr[0], user["username"], len(inner_ip_to_conn))
     try:
@@ -122,7 +148,9 @@ def downlink(conn, addr, inner_ip):
                 packet = crypto.decrypt(payload)
                 log.info("RX | %s", summarize_ip_packet(packet))
                 with clients_lock:
-                    client_stats[inner_ip]["up"] += len(packet)
+                    s = client_stats[inner_ip]
+                    s["up"] += len(packet)
+                    limiter = s["limiter"]
 
                 if len(packet) >= 20 and packet[9] in (6, 17):
                     ihl = (packet[0] & 0x0F) * 4
@@ -132,7 +160,10 @@ def downlink(conn, addr, inner_ip):
                         proto_name = "TCP" if packet[9] == 6 else "UDP"
                         if not port_table.get_connection(inner_ip, dport, proto_name):
                             port_table.add_connection(inner_ip, conn, sport, dport, proto_name)
+
+                limiter.wait_for(len(packet)) 
                 tun.write_packet(packet)
+                check_quota(inner_ip)
             elif msg_type == framing.MSG_HEARTBEAT:
                 log.debug("heartbeat from %s", inner_ip)
     except (ConnectionError, framing.ProtocolError) as e:
@@ -149,7 +180,7 @@ def downlink(conn, addr, inner_ip):
 
 
 def uplink():
-    """TUN -> encrypt -> back to the owning client."""
+    """TUN -> rate-limit -> encrypt -> back to the owning client."""
     while True:
         packet = tun.read_packet()
         if len(packet) < 20:
@@ -157,17 +188,21 @@ def uplink():
         dst_ip = socket.inet_ntoa(packet[16:20])
         with clients_lock:
             conn = inner_ip_to_conn.get(dst_ip)
-            stats = client_stats.get(dst_ip)
-            if stats:
-                stats["down"] += len(packet)
+            s = client_stats.get(dst_ip)
+            limiter = s["limiter"] if s else None
+            if s:
+                s["down"] += len(packet)
         if conn is None:
             log.warning("no tunnel client for %s, dropping", dst_ip)
             continue
         log.info("TX | %s", summarize_ip_packet(packet))
+        if limiter:
+            limiter.wait_for(len(packet))  
         try:
             conn.sendall(framing.build_frame(framing.MSG_DATA, crypto.encrypt(packet)))
         except OSError:
             pass
+        check_quota(dst_ip)
 
 
 def main():
