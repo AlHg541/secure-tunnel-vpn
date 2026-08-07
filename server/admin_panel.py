@@ -1,9 +1,10 @@
-"""Admin web panel (Phase 2 section 4).
+"""Admin web panel (Phase 2 section 4 + section 6 firewall management).
 
 Flask dashboard served on port 8000:
   - login with the admin account stored in SQLite
   - live tables: users (usage/quota), active sessions, traffic log
   - kick button to disconnect any client instantly
+  - firewall rule management (add/delete drop-accept rules)
 """
 import time
 from functools import wraps
@@ -27,6 +28,7 @@ PAGE = """
 body{font-family:sans-serif;background:#111;color:#eee;margin:2rem}
 table{border-collapse:collapse;margin-bottom:2rem}
 td,th{border:1px solid #444;padding:6px 10px}h3{color:#7cf}
+input,select{padding:4px;margin:2px}
 </style></head><body>
 <h2>VPN Admin Panel</h2><p><a href="/logout">Logout</a></p>
 
@@ -48,6 +50,22 @@ td,th{border:1px solid #444;padding:6px 10px}h3{color:#7cf}
 <table><tr><th>Time</th><th>User</th><th>Destination</th><th>Port</th><th>App</th><th>Domain</th></tr>
 {% for t in traffic %}<tr><td>{{ t.ts }}</td><td>{{ t.username }}</td><td>{{ t.dst_ip }}</td>
 <td>{{ t.dst_port }}</td><td>{{ t.app_protocol }}</td><td>{{ t.domain or '' }}</td></tr>{% endfor %}</table>
+
+<h3>Firewall Rules</h3>
+<form method="post" action="/firewall/add">
+<select name="action"><option value="drop">DROP</option><option value="accept">ACCEPT</option></select>
+<input name="dst_ip" placeholder="dst IP (optional)">
+<input name="dst_port" placeholder="dst port (optional)">
+<input name="domain" placeholder="domain (optional)">
+<select name="scope"><option value="global">global</option><option value="client">per-client</option></select>
+<input name="username" placeholder="username (per-client)">
+<button>Add rule</button></form>
+<table><tr><th>ID</th><th>Action</th><th>IP</th><th>Port</th><th>Domain</th><th>Scope</th><th>User</th><th></th></tr>
+{% for r in rules %}<tr><td>{{ r.id }}</td><td>{{ r.action }}</td><td>{{ r.dst_ip or '' }}</td>
+<td>{{ r.dst_port or '' }}</td><td>{{ r.domain or '' }}</td><td>{{ r.scope }}</td><td>{{ r.username or '' }}</td>
+<td><form method="post" action="/firewall/del" style="display:inline">
+<input type=hidden name="id" value="{{ r.id }}"><button>Delete</button></form></td></tr>
+{% else %}<tr><td colspan=8>no rules (default allow)</td></tr>{% endfor %}</table>
 </body></html>
 """
 
@@ -90,12 +108,27 @@ def create_app(db, get_active_sessions, kick_client):
                                       time.localtime(row["timestamp"]))
         return render_template_string(PAGE, users=db.get_all_users(),
                                       sessions=get_active_sessions(),
-                                      traffic=traffic)
+                                      traffic=traffic,
+                                      rules=db.get_firewall_rules())
 
     @app.route("/kick", methods=["POST"])
     @require_login
     def kick():
         kick_client(request.form.get("inner_ip"))
+        return redirect(url_for("dashboard"))
+
+    @app.route("/firewall/add", methods=["POST"])
+    @require_login
+    def fw_add():
+        f = request.form
+        db.add_firewall_rule(f.get("action"), f.get("dst_ip"), f.get("dst_port"),
+                             f.get("domain"), f.get("scope"), f.get("username"))
+        return redirect(url_for("dashboard"))
+
+    @app.route("/firewall/del", methods=["POST"])
+    @require_login
+    def fw_del():
+        db.delete_firewall_rule(int(request.form.get("id")))
         return redirect(url_for("dashboard"))
 
     return app

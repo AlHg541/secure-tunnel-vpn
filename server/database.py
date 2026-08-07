@@ -62,6 +62,15 @@ class Database:
                 app_protocol TEXT,
                 domain TEXT
             );
+            CREATE TABLE IF NOT EXISTS firewall_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            dst_ip TEXT,
+            dst_port INTEGER,
+            domain TEXT,
+            scope TEXT NOT NULL DEFAULT 'global',
+            username TEXT
+            );
             """)
             self.conn.commit()
 
@@ -165,6 +174,24 @@ class Database:
             return [dict(r) for r in self.conn.execute(
                 "SELECT username, status, used_bytes, quota_bytes,"
                 " rate_limit_bps, role FROM users").fetchall()]
+    def add_firewall_rule(self, action, dst_ip, dst_port, domain, scope, username):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO firewall_rules(action, dst_ip, dst_port, domain,"
+                " scope, username) VALUES (?,?,?,?,?,?)",
+                (action, dst_ip or None, int(dst_port) if dst_port else None,
+                 domain or None, scope, username or None))
+            self.conn.commit()
+
+    def delete_firewall_rule(self, rule_id):
+        with self._lock:
+            self.conn.execute("DELETE FROM firewall_rules WHERE id=?", (rule_id,))
+            self.conn.commit()
+
+    def get_firewall_rules(self):
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(
+                "SELECT * FROM firewall_rules ORDER BY id").fetchall()]
 
 
 def seed_default_users(db):

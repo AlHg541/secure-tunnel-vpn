@@ -7,7 +7,9 @@ Features:
   - Token-bucket rate limiting (per-user)
   - Quota enforcement (disconnect + status flip)
   - Traffic monitoring with domain extraction (DNS/HTTP/TLS SNI)
-  - Admin web panel (Flask on port 8000) with Kick action
+  - User-space firewall (drop/accept by IP/port/domain, global/per-client)
+  - Admin web panel (Flask on port 8000) with Kick + firewall management
+  - User portal (Flask on port 8001) with live quota purchase
   - Active session tracking and byte counters (Accounting)
 """
 import json
@@ -16,7 +18,6 @@ import threading
 import time
 import logging
 
-from server.user_portal import create_app as create_portal_app
 from common import framing, config
 from common.crypto import TunnelCrypto
 from common.tun_interface import TUNInterface
@@ -26,6 +27,8 @@ from common.rate_limiter import RateLimiter
 from server.database import Database, seed_default_users
 from server.traffic_monitor import TrafficMonitor
 from server.admin_panel import create_app
+from server.user_portal import create_app as create_portal_app
+from server.firewall import FirewallEngine
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(threadName)s] %(levelname)s %(message)s")
@@ -39,6 +42,7 @@ tun = TUNInterface(name="tun0", ip_address=SERVER_TUN_IP)
 port_table = PortMappingTable()
 db = Database()
 monitor = TrafficMonitor(db)
+firewall = FirewallEngine(db)
 
 clients_lock = threading.Lock()
 inner_ip_to_conn = {}
@@ -146,6 +150,7 @@ def kick_client(inner_ip):
         except OSError:
             pass
 
+
 def refresh_user_quota(username):
     """Apply a fresh quota to the user's LIVE session (no reconnect needed)."""
     user = db.get_user(username)
@@ -157,8 +162,9 @@ def refresh_user_quota(username):
                 s["quota"] = user["quota_bytes"]
     log.info("quota refreshed live for %s", username)
 
+
 def downlink(conn, addr, inner_ip):
-    """Client -> handshake -> decrypt -> monitor -> rate-limit -> TUN."""
+    """Client -> handshake -> decrypt -> firewall -> monitor -> limit -> TUN."""
     reader = framing.FrameReader(conn)
 
     user = perform_handshake(conn, reader, addr)
@@ -184,6 +190,10 @@ def downlink(conn, addr, inner_ip):
             if msg_type == framing.MSG_DATA:
                 packet = crypto.decrypt(payload)
                 log.info("RX | %s", summarize_ip_packet(packet))
+
+                if not firewall.allowed(user["username"], packet):
+                    continue   # dropped before NAT, already logged
+
                 with clients_lock:
                     s = client_stats[inner_ip]
                     s["up"] += len(packet)
@@ -256,18 +266,19 @@ def main():
         name="admin-panel", daemon=True).start()
     log.info("admin panel on http://0.0.0.0:8000")
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", config.SERVER_PORT))
-    srv.listen(8)
-    log.info("server listening on 0.0.0.0:%d", config.SERVER_PORT)
-
     portal = create_portal_app(db, refresh_user_quota)
     threading.Thread(
         target=lambda: portal.run(host="0.0.0.0", port=8001,
                                   debug=False, use_reloader=False),
         name="user-portal", daemon=True).start()
     log.info("user portal on http://0.0.0.0:8001")
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", config.SERVER_PORT))
+    srv.listen(8)
+    log.info("server listening on 0.0.0.0:%d", config.SERVER_PORT)
+
     while True:
         conn, addr = srv.accept()
         threading.Thread(target=downlink, args=(conn, addr, config.TUN_CLIENT_IP),
